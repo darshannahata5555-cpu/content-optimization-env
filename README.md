@@ -1,3 +1,12 @@
+---
+title: Content Optimization Env
+emoji: 🧠
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
 # Content Optimization RL Environment
 
 An **OpenEnv-compatible** reinforcement learning environment where an AI agent iteratively improves content (blog posts, social media copy, ORM replies) using step-by-step discrete actions and receives **per-step rewards** based on measurable quality improvements.
