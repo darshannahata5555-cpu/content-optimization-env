@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+*.egg
+.DS_Store
+baseline_report.json
+validation_output.txt
+validation_result.txt
+inference_output.txt

@@ -1,0 +1,190 @@
+# OpenEnv Environment Manifest
+# Content Optimization RL Environment
+
+spec_version: "1.0"
+
+name: content-optimization-env
+description: RL environment for optimizing content (blog, social, ORM) via iterative actions
+entry_point: env.environment:ContentOptimizationEnv
+
+display_name: "Content Optimization RL Environment"
+version: "1.0.0"
+type: "rl-environment"
+
+authors:
+  - name: "Meta Hackathon Team"
+
+tags:
+  - reinforcement-learning
+  - content-optimization
+  - seo
+  - readability
+  - nlp
+  - orm
+
+# Runtime configuration
+runtime:
+  language: python
+  version: ">=3.9"
+  dependencies:
+    - pydantic>=2.0
+    - openai>=1.0  # optional, for baseline script
+
+# API specification
+api:
+  reset:
+    description: "Reset the environment and return the initial observation."
+    returns: "Observation"
+  step:
+    description: "Execute one action and return (observation, reward, done, info)."
+    parameters:
+      action: "Action"
+    returns:
+      - "Observation"
+      - "Reward"
+      - "bool"
+      - "dict"
+  state:
+    description: "Return the full serialisable environment state."
+    returns: "dict"
+
+# Model definitions
+models:
+  observation:
+    module: "models.observation"
+    class: "Observation"
+    fields:
+      - name: original_content
+        type: string
+      - name: current_draft
+        type: string
+      - name: seo_score
+        type: float
+        range: [0.0, 1.0]
+      - name: readability_score
+        type: float
+        range: [0.0, 1.0]
+      - name: engagement_score
+        type: float
+        range: [0.0, 1.0]
+      - name: sentiment_score
+        type: float
+        range: [0.0, 1.0]
+      - name: step_count
+        type: integer
+      - name: actions_taken
+        type: list[string]
+      - name: task_id
+        type: string
+
+  action:
+    module: "models.action"
+    class: "Action"
+    fields:
+      - name: action_type
+        type: enum
+        values:
+          - rewrite_headline
+          - add_keywords
+          - improve_readability
+          - shorten_content
+          - change_tone
+          - optimize_cta
+          - generate_reply
+          - no_op
+      - name: parameters
+        type: dict
+        optional: true
+
+  reward:
+    module: "models.reward"
+    class: "Reward"
+    fields:
+      - name: total
+        type: float
+      - name: seo_delta
+        type: float
+      - name: readability_delta
+        type: float
+      - name: engagement_delta
+        type: float
+      - name: sentiment_delta
+        type: float
+      - name: repetition_penalty
+        type: float
+      - name: no_improvement_penalty
+        type: float
+      - name: degradation_penalty
+        type: float
+
+# Task definitions
+tasks:
+  - id: headline_seo
+    name: "Headline SEO Optimization"
+    difficulty: easy
+    description: >
+      Optimize a product announcement headline for SEO.
+      Success is measured by keyword presence, headline length,
+      and overall SEO score.
+    grader:
+      module: "env.graders"
+      function: "grade_task"
+    success_threshold: 0.8
+    max_steps: 10
+
+  - id: blog_readability
+    name: "Blog Readability Improvement"
+    difficulty: medium
+    description: >
+      Improve a dense blog post for readability and keyword coverage.
+      Success is measured by readability score, keyword density,
+      and paragraph structure.
+    grader:
+      module: "env.graders"
+      function: "grade_task"
+    success_threshold: 0.8
+    max_steps: 10
+
+  - id: orm_reply
+    name: "ORM Reply Generation & Refinement"
+    difficulty: hard
+    description: >
+      Generate and refine an empathetic, helpful reply to a negative
+      customer review.  Success is measured by sentiment alignment,
+      helpfulness markers, and tone correctness.
+    grader:
+      module: "env.graders"
+      function: "grade_task"
+    success_threshold: 0.85
+    max_steps: 10
+
+# Episode termination
+termination:
+  max_steps: 10
+  score_threshold: 0.9
+  conditions:
+    - "step_count >= max_steps"
+    - "composite_score >= score_threshold"
+
+# Reward structure
+reward_spec:
+  type: "per-step-delta"
+  components:
+    - name: seo_delta
+      weight: 1.0
+    - name: readability_delta
+      weight: 1.0
+    - name: engagement_delta
+      weight: 1.0
+    - name: sentiment_delta
+      weight: 1.0
+  penalties:
+    - name: repetition_penalty
+      value: -0.05
+      condition: "same action as previous step"
+    - name: no_improvement_penalty
+      value: -0.02
+      condition: "total metric delta ≈ 0"
+    - name: degradation_penalty
+      value: -0.10
+      condition: "total metric delta < 0"
