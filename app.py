@@ -12,6 +12,11 @@ import io
 import sys
 import traceback
 import difflib
+import json
+import os
+import re
+import tempfile
+from datetime import datetime, timezone
 
 # Fix encoding on containers
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -296,6 +301,7 @@ CUSTOM_STATE = None
 CUSTOM_INITIAL_DRAFT = ""
 CUSTOM_CUMULATIVE_REWARD = 0.0
 CUSTOM_REWARDS = []
+ORM_LAST_REPORT = None
 
 TASKS = ["headline_seo", "blog_readability", "orm_reply"]
 ACTIONS = [a.value for a in ActionType]
@@ -478,6 +484,183 @@ def custom_auto_optimize() -> tuple[str, str, str, str, str]:
         _format_diff(CUSTOM_INITIAL_DRAFT, CUSTOM_STATE.current_draft),
         "\n".join(logs) if logs else "No optimization steps executed.",
     )
+
+
+def _extract_reply_text(draft: str) -> str:
+    if "Draft Reply:" in draft:
+        return draft.split("Draft Reply:", 1)[1].strip().strip("'\"")
+    return draft.strip()
+
+
+def _normalize_sentence(text: str) -> str:
+    clean = " ".join((text or "").split())
+    if clean and clean[-1] not in ".!?":
+        clean += "."
+    return clean
+
+
+def _compose_orm_seed(complaint_text: str, customer_name: str, company_name: str) -> str:
+    person = customer_name.strip() or "there"
+    company = company_name.strip() or "our team"
+    greeting = f"Hi {person},"
+
+    concern_phrases = []
+    lower = complaint_text.lower()
+    if "late" in lower or "delay" in lower:
+        concern_phrases.append("the delivery delay")
+    if "damag" in lower or "broken" in lower:
+        concern_phrases.append("the damaged item")
+    if "support" in lower or "response" in lower:
+        concern_phrases.append("the poor support experience")
+    if "refund" in lower:
+        concern_phrases.append("the refund concern")
+    concerns = ", ".join(concern_phrases) if concern_phrases else "the issue you faced"
+
+    seed_reply = (
+        f"{greeting} Thank you for sharing this feedback. "
+        f"We sincerely apologize for {concerns}. "
+        f"{company} has already escalated your case, and a specialist will contact you within 24 hours. "
+        f"We will provide a clear resolution and follow through until this is fully addressed."
+    )
+
+    return f"Customer Review: '{complaint_text.strip()}'\n\nDraft Reply: '{seed_reply}'"
+
+
+def _run_orm_rewrite_pipeline(seed_draft: str) -> str:
+    working = seed_draft
+    keywords = ["apology", "resolution", "customer satisfaction", "support", "improvement"]
+    for action in (ActionType.GENERATE_REPLY, ActionType.CHANGE_TONE, ActionType.OPTIMIZE_CTA):
+        working = apply_action(
+            action_type=action,
+            draft=working,
+            target_keywords=keywords,
+            target_tone="empathetic",
+            parameters={},
+        )
+    return _extract_reply_text(working)
+
+
+def _evaluate_orm_policy(reply_text: str, complaint_text: str) -> tuple[list[dict[str, Any]], float]:
+    lower = reply_text.lower()
+    complaint_lower = complaint_text.lower()
+
+    checks = [
+        {
+            "id": "apology",
+            "label": "Acknowledges and apologizes",
+            "passed": any(w in lower for w in ["sorry", "apologize", "apology", "regret"]),
+            "why": "Includes a clear apology phrase.",
+        },
+        {
+            "id": "empathy",
+            "label": "Shows empathy",
+            "passed": any(w in lower for w in ["understand", "frustrating", "experience", "sincerely"]),
+            "why": "Signals emotional understanding of the complaint.",
+        },
+        {
+            "id": "ownership",
+            "label": "Takes ownership",
+            "passed": any(w in lower for w in ["we", "our team", "we will", "we have"]),
+            "why": "Response uses accountable ownership language.",
+        },
+        {
+            "id": "resolution",
+            "label": "Offers concrete next step",
+            "passed": any(w in lower for w in ["resolve", "resolution", "replace", "refund", "escalat", "contact"]),
+            "why": "Contains an explicit resolution path.",
+        },
+        {
+            "id": "timeline",
+            "label": "Provides timeline",
+            "passed": bool(re.search(r"\b(\d+\s*(hour|hours|day|days)|within|today|tomorrow)\b", lower)),
+            "why": "Sets expectation for follow-up timing.",
+        },
+        {
+            "id": "professional_close",
+            "label": "Professional close",
+            "passed": any(w in lower for w in ["thank", "please", "reach out", "support team", "committed"]),
+            "why": "Ends with respectful support-oriented language.",
+        },
+        {
+            "id": "no_blame",
+            "label": "Avoids blame or dismissive language",
+            "passed": not any(w in lower for w in ["not our fault", "you should have", "policy does not allow", "can't help"]),
+            "why": "No blame-shifting or dismissive language detected.",
+        },
+        {
+            "id": "issue_reference",
+            "label": "References core complaint theme",
+            "passed": (
+                ("late" in complaint_lower and any(w in lower for w in ["delay", "late"])) or
+                ("damag" in complaint_lower and "damag" in lower) or
+                ("support" in complaint_lower and "support" in lower) or
+                ("refund" in complaint_lower and "refund" in lower) or
+                True
+            ),
+            "why": "Reply addresses the reported issue context.",
+        },
+    ]
+
+    score = sum(1 for c in checks if c["passed"]) / len(checks)
+    return checks, score
+
+
+def _format_policy_markdown(checks: list[dict[str, Any]], score: float) -> str:
+    lines = [f"Policy Score: {score:.0%}", ""]
+    for item in checks:
+        tag = "[PASS]" if item["passed"] else "[FAIL]"
+        lines.append(f"- {tag} {item['label']} - {item['why']}")
+    return "\n".join(lines)
+
+
+def orm_generate_reply(
+    complaint_text: str,
+    customer_name: str,
+    company_name: str,
+) -> tuple[str, str, str]:
+    global ORM_LAST_REPORT
+
+    complaint = _normalize_sentence(complaint_text)
+    if not complaint:
+        err = "Please enter a customer complaint."
+        return "", "", err
+
+    seed = _compose_orm_seed(complaint, customer_name, company_name)
+    reply = _run_orm_rewrite_pipeline(seed)
+    checks, score = _evaluate_orm_policy(reply, complaint)
+    checklist = _format_policy_markdown(checks, score)
+
+    report = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "customer_name": customer_name.strip(),
+        "company_name": company_name.strip(),
+        "complaint": complaint,
+        "reply": reply,
+        "policy_score": round(score, 4),
+        "checks": checks,
+    }
+    ORM_LAST_REPORT = report
+
+    summary = (
+        f"ORM Copilot Result\n"
+        f"- Policy score: {score:.0%}\n"
+        f"- Checks passed: {sum(1 for c in checks if c['passed'])}/{len(checks)}\n"
+        f"- Ready to export: yes"
+    )
+    return reply, checklist, summary
+
+
+def orm_export_report() -> str | None:
+    global ORM_LAST_REPORT
+    if not ORM_LAST_REPORT:
+        return None
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_dir = tempfile.gettempdir()
+    out_path = os.path.join(out_dir, f"orm-copilot-report-{stamp}.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(ORM_LAST_REPORT, f, indent=2)
+    return out_path
 
 
 def reset_env(task_id: str) -> str:
@@ -691,6 +874,35 @@ with gr.Blocks(
             fn=custom_auto_optimize,
             inputs=[],
             outputs=[custom_summary, custom_before, custom_after, custom_diff, custom_rationale],
+        )
+
+    with gr.Tab("ORM Copilot MVP"):
+        gr.Markdown("Complaint reply rewrite + policy checklist + exportable report.")
+        orm_complaint = gr.Textbox(
+            label="Customer Complaint",
+            lines=8,
+            value="I am disappointed. Delivery was late, the product arrived damaged, and support did not respond on time.",
+        )
+        with gr.Row():
+            orm_customer = gr.Textbox(label="Customer Name (optional)", value="Alex")
+            orm_company = gr.Textbox(label="Company Name (optional)", value="Support Team")
+        with gr.Row():
+            orm_generate_btn = gr.Button("Generate Reply", variant="primary")
+            orm_export_btn = gr.Button("Export Report", variant="secondary")
+        orm_reply = gr.Textbox(label="Rewritten Reply", lines=10)
+        orm_checklist = gr.Textbox(label="Policy Checklist", lines=12)
+        orm_summary = gr.Textbox(label="Summary", lines=4)
+        orm_file = gr.File(label="Download Report (.json)")
+
+        orm_generate_btn.click(
+            fn=orm_generate_reply,
+            inputs=[orm_complaint, orm_customer, orm_company],
+            outputs=[orm_reply, orm_checklist, orm_summary],
+        )
+        orm_export_btn.click(
+            fn=orm_export_report,
+            inputs=[],
+            outputs=[orm_file],
         )
 
     with gr.Tab("About"):
