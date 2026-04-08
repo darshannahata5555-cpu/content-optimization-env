@@ -58,7 +58,7 @@ from models.observation import Observation
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Optional - if you use from_docker_image():
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
@@ -182,7 +182,7 @@ def get_model_action(client: OpenAI, obs: Observation, step: int, history: List[
         text = (completion.choices[0].message.content or "").strip()
         return parse_action(text) if text else ActionType.NO_OP
     except Exception as exc:
-        print(f"[DEBUG] Model request failed: {exc}", flush=True)
+        print(f"Model request failed: {exc}", file=sys.stderr, flush=True)
         return ActionType.NO_OP
 
 
@@ -272,7 +272,7 @@ def run_task(task_id: str, client: Optional[OpenAI], use_llm: bool) -> None:
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as exc:
-        print(f"[DEBUG] Exception during episode: {exc}", flush=True)
+        print(f"Episode failed for task {task_id}: {exc}", file=sys.stderr, flush=True)
 
     finally:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
@@ -289,8 +289,6 @@ def main() -> None:
 
     if use_llm:
         client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
-    else:
-        print("[DEBUG] HF_TOKEN not set -- using heuristic agent", flush=True)
 
     # Run all 3 tasks
     tasks = ContentOptimizationEnv.available_tasks()

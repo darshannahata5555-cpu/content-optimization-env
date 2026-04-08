@@ -1,35 +1,216 @@
 """
-app.py — Gradio demo UI for the Content Optimization RL Environment.
+app.py — Gradio demo UI + OpenEnv REST API for the Content Optimization RL
+Environment.
 
-This gives the HF Space a persistent web server so it stays "Running".
-Users can interact with the environment through the browser.
+This gives the HF Space:
+  1. A persistent Gradio web UI for interactive use.
+  2. REST API endpoints (/reset, /step, /state) for the OpenEnv automated
+     checker (Phase 1 validation).
 """
 
 import io
 import sys
-import json
+import traceback
 
 # Fix encoding on containers
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+from typing import Any, Dict
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import gradio as gr
 
 from env.environment import ContentOptimizationEnv
 from models.action import Action, ActionType
 
 # ---------------------------------------------------------------------------
-# Global env instance (reset per session via button)
+# FastAPI app (primary — Gradio will be mounted onto this)
 # ---------------------------------------------------------------------------
-ENV = None
+app = FastAPI(
+    title="Content Optimization RL Environment",
+    description="OpenEnv-compatible RL environment for content optimization",
+    version="1.0.0",
+)
+
+# ---------------------------------------------------------------------------
+# Global env instances for API usage (keyed by session, simple global for now)
+# ---------------------------------------------------------------------------
+API_ENV = None
+
+
+def _json_error(message: str, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(content={"error": message}, status_code=status_code)
+
+
+async def _read_json_body(request: Request) -> Dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
+def _parse_task_id(body: Dict[str, Any]) -> str:
+    return body.get("task_id") or body.get("task") or "headline_seo"
+
+
+def _parse_max_steps(body: Dict[str, Any]) -> int:
+    raw_value = body.get("max_steps", 10)
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return 10
+
+
+def _build_reset_payload() -> Dict[str, Any]:
+    observation = API_ENV.reset()
+    return observation.model_dump()
+
+
+def _build_step_payload(action_data: Dict[str, Any]) -> Dict[str, Any]:
+    action_type_raw = action_data.get("action_type") or action_data.get("action") or "no_op"
+    parameters = action_data.get("parameters", {})
+
+    if isinstance(action_type_raw, dict):
+        action_type_raw = action_type_raw.get("action_type", "no_op")
+    if isinstance(action_type_raw, list):
+        action_type_raw = action_type_raw[0] if action_type_raw else "no_op"
+
+    action = Action(
+        action_type=ActionType(str(action_type_raw)),
+        parameters=parameters if isinstance(parameters, dict) else {},
+    )
+    obs, reward, done, info = API_ENV.step(action)
+    return {
+        "observation": obs.model_dump(),
+        "reward": reward.model_dump(),
+        "done": done,
+        "info": info,
+    }
+
+
+# ---------------------------------------------------------------------------
+# OpenEnv REST API endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/reset")
+@app.post("/openenv/reset")
+async def api_reset(request: Request):
+    """
+    Reset the environment.
+
+    Expected JSON body:
+        {"task_id": "headline_seo"}  (optional, defaults to headline_seo)
+
+    Returns: Observation as JSON
+    """
+    global API_ENV
+    body = await _read_json_body(request)
+    task_id = _parse_task_id(body)
+    max_steps = _parse_max_steps(body)
+
+    try:
+        API_ENV = ContentOptimizationEnv(task_id=task_id, max_steps=max_steps)
+        return JSONResponse(content=_build_reset_payload(), status_code=200)
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(
+            content={"error": str(e), "traceback": traceback.format_exc()},
+            status_code=500,
+        )
+
+
+@app.post("/step")
+@app.post("/openenv/step")
+async def api_step(request: Request):
+    """
+    Take one step in the environment.
+
+    Expected JSON body:
+        {"action": {"action_type": "rewrite_headline", "parameters": {}}}
+        or simply:
+        {"action_type": "rewrite_headline"}
+
+    Returns: {"observation": ..., "reward": ..., "done": bool, "info": dict}
+    """
+    global API_ENV
+    if API_ENV is None:
+        return _json_error("Environment not initialized. Call POST /reset first.")
+
+    body = await _read_json_body(request)
+
+    try:
+        if "action" in body and isinstance(body["action"], dict):
+            action_data = body["action"]
+        else:
+            action_data = body
+        return JSONResponse(content=_build_step_payload(action_data), status_code=200)
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(
+            content={"error": str(e), "traceback": traceback.format_exc()},
+            status_code=500,
+        )
+
+
+@app.get("/state")
+@app.post("/state")
+@app.get("/openenv/state")
+@app.post("/openenv/state")
+async def api_state():
+    """
+    Return the full serialisable environment state.
+
+    Returns: dict with all environment state fields.
+    """
+    global API_ENV
+    if API_ENV is None:
+        return _json_error("Environment not initialized. Call POST /reset first.")
+
+    try:
+        state = API_ENV.state()
+        return JSONResponse(content=state, status_code=200)
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(
+            content={"error": str(e), "traceback": traceback.format_exc()},
+            status_code=500,
+        )
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "environment": "content-optimization-env",
+            "version": "1.0.0",
+            "tasks": ContentOptimizationEnv.available_tasks(),
+            "actions": ContentOptimizationEnv.available_actions(),
+        },
+        status_code=200,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gradio UI functions (unchanged)
+# ---------------------------------------------------------------------------
+GRADIO_ENV = None
+
+TASKS = ["headline_seo", "blog_readability", "orm_reply"]
+ACTIONS = [a.value for a in ActionType]
 
 
 def reset_env(task_id: str) -> str:
     """Reset the environment with the selected task."""
-    global ENV
-    ENV = ContentOptimizationEnv(task_id=task_id, max_steps=10)
-    obs = ENV.reset()
-    state = ENV.state()
+    global GRADIO_ENV
+    GRADIO_ENV = ContentOptimizationEnv(task_id=task_id, max_steps=10)
+    obs = GRADIO_ENV.reset()
+    state = GRADIO_ENV.state()
 
     output = (
         f"=== Environment Reset ===\n"
@@ -47,12 +228,12 @@ def reset_env(task_id: str) -> str:
 
 def step_env(action_name: str) -> str:
     """Take one step in the environment."""
-    global ENV
-    if ENV is None:
+    global GRADIO_ENV
+    if GRADIO_ENV is None:
         return "ERROR: Please reset the environment first!"
 
-    if ENV._state.done:
-        state = ENV.state()
+    if GRADIO_ENV._state.done:
+        state = GRADIO_ENV.state()
         return (
             f"Episode is DONE.\n"
             f"Final Grade: {state['task_grade']:.3f}\n"
@@ -66,7 +247,7 @@ def step_env(action_name: str) -> str:
         return f"ERROR: Unknown action '{action_name}'"
 
     action = Action(action_type=action_type)
-    obs, reward, done, info = ENV.step(action)
+    obs, reward, done, info = GRADIO_ENV.step(action)
 
     status = "DONE" if done else "RUNNING"
     output = (
@@ -91,7 +272,7 @@ def step_env(action_name: str) -> str:
     )
 
     if done:
-        state = ENV.state()
+        state = GRADIO_ENV.state()
         output += (
             f"\n=== EPISODE FINISHED ===\n"
             f"Final Grade: {state['task_grade']:.3f}\n"
@@ -158,15 +339,11 @@ def run_full_episode(task_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gradio UI
+# Build Gradio UI
 # ---------------------------------------------------------------------------
-
-TASKS = ["headline_seo", "blog_readability", "orm_reply"]
-ACTIONS = [a.value for a in ActionType]
 
 with gr.Blocks(
     title="Content Optimization RL Environment",
-    theme=gr.themes.Soft(),
 ) as demo:
     gr.Markdown(
         "# Content Optimization RL Environment\n"
@@ -216,7 +393,21 @@ with gr.Blocks(
 
 ### Reward
 Per-step reward = metric deltas + penalties for repetition/degradation
+
+### API Endpoints
+- `POST /reset` — Reset environment (body: `{"task_id": "headline_seo"}`)
+- `POST /step` — Take action (body: `{"action_type": "rewrite_headline"}`)
+- `GET /state` — Get full environment state
+- `GET /health` — Health check
             """
         )
 
-demo.launch(server_name="0.0.0.0", server_port=7860)
+
+# ---------------------------------------------------------------------------
+# Mount Gradio onto FastAPI and launch
+# ---------------------------------------------------------------------------
+app = gr.mount_gradio_app(app, demo, path="/")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
