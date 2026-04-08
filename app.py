@@ -17,6 +17,9 @@ import os
 import re
 import tempfile
 from datetime import datetime, timezone
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 # Fix encoding on containers
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -663,6 +666,180 @@ def orm_export_report() -> str | None:
     return out_path
 
 
+def _extract_youtube_video_id(video_url: str) -> str:
+    raw = (video_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urllib_parse.urlparse(raw)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").strip("/")
+
+    if host.endswith("youtu.be"):
+        return path.split("/")[0]
+
+    if "youtube.com" in host:
+        if path == "watch":
+            return urllib_parse.parse_qs(parsed.query).get("v", [""])[0]
+        if path.startswith("shorts/") or path.startswith("embed/"):
+            return path.split("/")[1] if len(path.split("/")) > 1 else ""
+
+    return ""
+
+
+def _http_json_request(url: str, method: str = "GET", headers: dict[str, str] | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    req_headers = headers or {}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req_headers = {**req_headers, "Content-Type": "application/json"}
+    req = urllib_request.Request(url=url, method=method, headers=req_headers, data=data)
+    with urllib_request.urlopen(req, timeout=30) as resp:
+        payload = resp.read().decode("utf-8")
+    return json.loads(payload) if payload else {}
+
+
+def _fetch_youtube_comments(video_id: str, api_key: str, max_results: int) -> list[dict[str, str]]:
+    encoded_params = urllib_parse.urlencode(
+        {
+            "part": "snippet",
+            "videoId": video_id,
+            "maxResults": str(max(1, min(max_results, 100))),
+            "order": "time",
+            "textFormat": "plainText",
+            "key": api_key,
+        }
+    )
+    url = f"https://www.googleapis.com/youtube/v3/commentThreads?{encoded_params}"
+    data = _http_json_request(url)
+    items = data.get("items", [])
+
+    comments = []
+    for item in items:
+        snippet = item.get("snippet", {})
+        top = snippet.get("topLevelComment", {}).get("snippet", {})
+        comments.append(
+            {
+                "comment_id": item.get("snippet", {}).get("topLevelComment", {}).get("id", ""),
+                "author": top.get("authorDisplayName", "Unknown"),
+                "text": top.get("textOriginal", "").strip(),
+                "published_at": top.get("publishedAt", ""),
+            }
+        )
+    return [c for c in comments if c["comment_id"] and c["text"]]
+
+
+def _post_youtube_reply(parent_comment_id: str, reply_text: str, oauth_token: str) -> tuple[bool, str]:
+    url = "https://www.googleapis.com/youtube/v3/comments?part=snippet"
+    headers = {"Authorization": f"Bearer {oauth_token.strip()}"}
+    body = {
+        "snippet": {
+            "parentId": parent_comment_id,
+            "textOriginal": reply_text,
+        }
+    }
+    try:
+        _http_json_request(url=url, method="POST", headers=headers, body=body)
+        return True, "posted"
+    except urllib_error.HTTPError as exc:
+        try:
+            err_data = exc.read().decode("utf-8")
+        except Exception:
+            err_data = str(exc)
+        return False, f"http_{exc.code}: {err_data[:160]}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def auto_reply_youtube_comments(
+    video_url: str,
+    youtube_api_key: str,
+    company_name: str,
+    max_comments: int,
+    auto_post: bool,
+    oauth_token: str,
+) -> tuple[str, list[list[str]], str | None]:
+    video_id = _extract_youtube_video_id(video_url)
+    if not video_id:
+        return "Invalid YouTube URL. Provide a valid `watch?v=` or `youtu.be/` link.", [], None
+    if not (youtube_api_key or "").strip():
+        return "YouTube API key is required to fetch comments.", [], None
+
+    try:
+        comments = _fetch_youtube_comments(video_id, youtube_api_key.strip(), max_comments)
+    except urllib_error.HTTPError as exc:
+        return f"Failed to fetch comments: HTTP {exc.code}", [], None
+    except Exception as exc:
+        return f"Failed to fetch comments: {exc}", [], None
+
+    if not comments:
+        return "No comments found for this video (or comments are disabled).", [], None
+
+    rows: list[list[str]] = []
+    report_entries: list[dict[str, Any]] = []
+    posted_count = 0
+
+    for c in comments:
+        reply, _, _ = orm_generate_reply(c["text"], c["author"], company_name)
+        checks, score = _evaluate_orm_policy(reply, c["text"])
+        status = "suggested"
+
+        if auto_post:
+            if not (oauth_token or "").strip():
+                status = "skipped: missing OAuth token"
+            else:
+                ok, msg = _post_youtube_reply(c["comment_id"], reply, oauth_token)
+                status = msg if ok else f"failed: {msg}"
+                if ok:
+                    posted_count += 1
+
+        rows.append(
+            [
+                c["author"][:40],
+                c["text"][:180],
+                reply[:220],
+                f"{score:.0%}",
+                status,
+            ]
+        )
+        report_entries.append(
+            {
+                "author": c["author"],
+                "comment_id": c["comment_id"],
+                "comment": c["text"],
+                "reply": reply,
+                "policy_score": round(score, 4),
+                "checks": checks,
+                "status": status,
+                "published_at": c["published_at"],
+            }
+        )
+
+    report = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "video_url": video_url,
+        "video_id": video_id,
+        "auto_post": auto_post,
+        "total_comments": len(report_entries),
+        "posted_replies": posted_count,
+        "entries": report_entries,
+    }
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_path = os.path.join(tempfile.gettempdir(), f"youtube-orm-auto-reply-{stamp}.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    summary = (
+        f"YouTube Auto-Reply Run Complete\n"
+        f"- Video ID: {video_id}\n"
+        f"- Comments processed: {len(report_entries)}\n"
+        f"- Replies posted: {posted_count if auto_post else 0}\n"
+        f"- Mode: {'auto-post' if auto_post else 'draft only'}\n"
+        f"- Report: {out_path}"
+    )
+    return summary, rows, out_path
+
+
 def reset_env(task_id: str) -> str:
     """Reset the environment with the selected task."""
     global GRADIO_ENV
@@ -903,6 +1080,48 @@ with gr.Blocks(
             fn=orm_export_report,
             inputs=[],
             outputs=[orm_file],
+        )
+
+    with gr.Tab("YouTube Auto Reply"):
+        gr.Markdown(
+            "Fetch latest YouTube comments from a video, generate ORM replies, and optionally auto-post using OAuth."
+        )
+        yt_video_url = gr.Textbox(
+            label="YouTube Video URL",
+            value="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        )
+        yt_api_key = gr.Textbox(
+            label="YouTube Data API Key",
+            type="password",
+            placeholder="AIza...",
+        )
+        with gr.Row():
+            yt_company = gr.Textbox(label="Company Name for Reply Context", value="Support Team")
+            yt_max_comments = gr.Slider(minimum=1, maximum=50, step=1, value=10, label="Max Comments")
+        yt_auto_post = gr.Checkbox(
+            label="Auto-post replies to YouTube",
+            value=False,
+        )
+        yt_oauth_token = gr.Textbox(
+            label="OAuth Access Token (required only when auto-post is on)",
+            type="password",
+            placeholder="ya29....",
+        )
+        yt_run_btn = gr.Button("Fetch + Reply", variant="primary")
+        yt_summary = gr.Textbox(label="Run Summary", lines=7)
+        yt_table = gr.Dataframe(
+            headers=["Author", "Comment", "Reply", "Policy Score", "Status"],
+            datatype=["str", "str", "str", "str", "str"],
+            row_count=10,
+            column_count=(5, "fixed"),
+            label="Generated Replies",
+        )
+        yt_report = gr.File(label="Download Batch Report (.json)")
+
+        yt_run_btn.click(
+            fn=auto_reply_youtube_comments,
+            inputs=[yt_video_url, yt_api_key, yt_company, yt_max_comments, yt_auto_post, yt_oauth_token],
+            outputs=[yt_summary, yt_table, yt_report],
         )
 
     with gr.Tab("About"):
