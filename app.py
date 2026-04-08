@@ -24,6 +24,8 @@ import gradio as gr
 
 from env.environment import ContentOptimizationEnv
 from models.action import Action, ActionType
+from models.observation import Observation
+from models.reward import Reward
 
 # ---------------------------------------------------------------------------
 # FastAPI app (primary — Gradio will be mounted onto this)
@@ -186,11 +188,96 @@ async def health():
     """Health check endpoint."""
     return JSONResponse(
         content={
-            "status": "ok",
+            "status": "healthy",
             "environment": "content-optimization-env",
             "version": "1.0.0",
             "tasks": ContentOptimizationEnv.available_tasks(),
             "actions": ContentOptimizationEnv.available_actions(),
+        },
+        status_code=200,
+    )
+
+
+@app.get("/metadata")
+async def metadata():
+    """OpenEnv metadata endpoint."""
+    return JSONResponse(
+        content={
+            "name": "content-optimization-env",
+            "display_name": "Content Optimization RL Environment",
+            "description": "RL environment for optimizing content with iterative actions and per-step rewards.",
+            "version": "1.0.0",
+            "mode": "simulation",
+        },
+        status_code=200,
+    )
+
+
+@app.get("/schema")
+async def schema():
+    """Return action, observation, and state schemas."""
+    return JSONResponse(
+        content={
+            "action": Action.model_json_schema(),
+            "observation": Observation.model_json_schema(),
+            "state": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "original_content": {"type": "string"},
+                    "current_draft": {"type": "string"},
+                    "seo_score": {"type": "number"},
+                    "readability_score": {"type": "number"},
+                    "engagement_score": {"type": "number"},
+                    "sentiment_score": {"type": "number"},
+                    "step_count": {"type": "integer"},
+                    "max_steps": {"type": "integer"},
+                    "done": {"type": "boolean"},
+                    "actions_taken": {"type": "array", "items": {"type": "string"}},
+                    "target_keywords": {"type": "array", "items": {"type": "string"}},
+                    "target_tone": {"type": "string"},
+                    "composite_score": {"type": "number"},
+                    "task_grade": {"type": "number"},
+                    "cumulative_reward": {"type": "number"},
+                    "episode_rewards": {"type": "array", "items": {"type": "number"}},
+                },
+                "required": [
+                    "task_id",
+                    "original_content",
+                    "current_draft",
+                    "seo_score",
+                    "readability_score",
+                    "engagement_score",
+                    "sentiment_score",
+                    "step_count",
+                    "max_steps",
+                    "done",
+                    "actions_taken",
+                    "target_keywords",
+                    "target_tone",
+                    "composite_score",
+                    "task_grade",
+                    "cumulative_reward",
+                    "episode_rewards",
+                ],
+            },
+            "reward": Reward.model_json_schema(),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/mcp")
+async def mcp():
+    """Minimal JSON-RPC probe response for validator compatibility."""
+    return JSONResponse(
+        content={
+            "jsonrpc": "2.0",
+            "id": None,
+            "result": {
+                "name": "content-optimization-env",
+                "status": "healthy",
+            },
         },
         status_code=200,
     )
@@ -408,6 +495,12 @@ Per-step reward = metric deltas + penalties for repetition/degradation
 # ---------------------------------------------------------------------------
 app = gr.mount_gradio_app(app, demo, path="/")
 
-if __name__ == "__main__":
+
+def main() -> None:
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=7860)
+
+
+if __name__ == "__main__":
+    main()
