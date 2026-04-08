@@ -11,6 +11,7 @@ This gives the HF Space:
 import io
 import sys
 import traceback
+import difflib
 
 # Fix encoding on containers
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -23,6 +24,10 @@ from fastapi.responses import JSONResponse
 import gradio as gr
 
 from env.environment import ContentOptimizationEnv
+from env.actions import apply_action
+from env.graders import recompute_metrics
+from env.reward import compute_reward
+from env.state import ContentState
 from models.action import Action, ActionType
 from models.observation import Observation
 from models.reward import Reward
@@ -287,9 +292,192 @@ async def mcp():
 # Gradio UI functions (unchanged)
 # ---------------------------------------------------------------------------
 GRADIO_ENV = None
+CUSTOM_STATE = None
+CUSTOM_INITIAL_DRAFT = ""
+CUSTOM_CUMULATIVE_REWARD = 0.0
+CUSTOM_REWARDS = []
 
 TASKS = ["headline_seo", "blog_readability", "orm_reply"]
 ACTIONS = [a.value for a in ActionType]
+
+ACTION_RATIONALE = {
+    "rewrite_headline": "Improves headline SEO and keyword targeting.",
+    "add_keywords": "Adds missing target keywords to improve discoverability.",
+    "improve_readability": "Breaks complex text into simpler, clearer structure.",
+    "shorten_content": "Removes filler and redundant phrasing.",
+    "change_tone": "Aligns tone with your chosen communication style.",
+    "optimize_cta": "Strengthens conversion by improving the call-to-action.",
+    "generate_reply": "Generates a stronger support/ORM-style response.",
+    "no_op": "Keeps the current draft unchanged.",
+}
+
+
+def _parse_keywords(raw_keywords: str) -> list[str]:
+    parts = [p.strip() for p in (raw_keywords or "").split(",")]
+    return [p for p in parts if p]
+
+
+def _format_diff(before: str, after: str, max_lines: int = 120) -> str:
+    lines = list(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile="before",
+            tofile="after",
+            lineterm="",
+        )
+    )
+    if not lines:
+        return "No text changes yet."
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["... (diff truncated)"]
+    return "\n".join(lines)
+
+
+def _format_custom_summary(
+    state: ContentState,
+    reward: float,
+    action_name: str,
+) -> str:
+    grade = state.composite_score()
+    done_val = str(state.done).lower()
+    rationale = ACTION_RATIONALE.get(action_name, "Action applied.")
+    return (
+        f"Step: {state.step_count}/{state.max_steps}\n"
+        f"Action: {action_name}\n"
+        f"Rationale: {rationale}\n"
+        f"Reward: {reward:+.4f}\n"
+        f"Cumulative Reward: {CUSTOM_CUMULATIVE_REWARD:+.4f}\n"
+        f"SEO: {state.seo_score:.3f} | Readability: {state.readability_score:.3f} | "
+        f"Engagement: {state.engagement_score:.3f} | Sentiment: {state.sentiment_score:.3f}\n"
+        f"Composite Grade: {grade:.3f}\n"
+        f"Done: {done_val}"
+    )
+
+
+def _suggest_custom_action(state: ContentState) -> ActionType:
+    if state.step_count == 0 and state.target_tone == "empathetic":
+        return ActionType.GENERATE_REPLY
+
+    scores = {
+        "seo": state.seo_score,
+        "readability": state.readability_score,
+        "engagement": state.engagement_score,
+        "sentiment": state.sentiment_score,
+    }
+    weakest = min(scores, key=scores.get)
+
+    candidate_map = {
+        "seo": [ActionType.REWRITE_HEADLINE, ActionType.ADD_KEYWORDS],
+        "readability": [ActionType.IMPROVE_READABILITY, ActionType.SHORTEN_CONTENT],
+        "engagement": [ActionType.OPTIMIZE_CTA, ActionType.ADD_KEYWORDS],
+        "sentiment": [ActionType.CHANGE_TONE, ActionType.GENERATE_REPLY],
+    }
+    candidates = candidate_map[weakest]
+    last_action = state.actions_taken[-1] if state.actions_taken else None
+
+    for action in candidates:
+        if action.value != last_action:
+            return action
+    return candidates[0]
+
+
+def custom_reset_env(
+    input_text: str,
+    keywords_csv: str,
+    tone: str,
+    max_steps: int,
+) -> tuple[str, str, str, str, str]:
+    global CUSTOM_STATE, CUSTOM_INITIAL_DRAFT, CUSTOM_CUMULATIVE_REWARD, CUSTOM_REWARDS
+
+    draft = (input_text or "").strip()
+    if not draft:
+        err = "ERROR: Please provide input text."
+        return err, "", "", "", err
+
+    target_keywords = _parse_keywords(keywords_csv)
+    if not target_keywords:
+        target_keywords = ["content", "quality", "improvement"]
+
+    CUSTOM_STATE = ContentState(
+        original_content=draft,
+        current_draft=draft,
+        target_keywords=target_keywords,
+        target_tone=tone,
+        task_id="custom_input",
+        max_steps=max_steps,
+    )
+    recompute_metrics(CUSTOM_STATE)
+
+    CUSTOM_INITIAL_DRAFT = draft
+    CUSTOM_CUMULATIVE_REWARD = 0.0
+    CUSTOM_REWARDS = []
+
+    summary = _format_custom_summary(CUSTOM_STATE, 0.0, "reset")
+    return summary, draft, draft, _format_diff(draft, draft), "Custom session initialized."
+
+
+def custom_step_env(action_name: str) -> tuple[str, str, str, str, str]:
+    global CUSTOM_STATE, CUSTOM_CUMULATIVE_REWARD, CUSTOM_REWARDS
+
+    if CUSTOM_STATE is None:
+        err = "ERROR: Initialize custom session first."
+        return err, "", "", "", err
+
+    if CUSTOM_STATE.done:
+        summary = _format_custom_summary(CUSTOM_STATE, 0.0, action_name)
+        return summary, CUSTOM_STATE.current_draft, CUSTOM_STATE.current_draft, "No changes. Episode already done.", "Episode finished."
+
+    before = CUSTOM_STATE.current_draft
+    old_state = CUSTOM_STATE.snapshot()
+    action_type = ActionType(action_name)
+    after = apply_action(
+        action_type=action_type,
+        draft=CUSTOM_STATE.current_draft,
+        target_keywords=CUSTOM_STATE.target_keywords,
+        target_tone=CUSTOM_STATE.target_tone,
+        parameters={},
+    )
+    CUSTOM_STATE.current_draft = after
+    recompute_metrics(CUSTOM_STATE)
+    CUSTOM_STATE.step_count += 1
+    CUSTOM_STATE.actions_taken.append(action_name)
+
+    reward_obj = compute_reward(old_state, CUSTOM_STATE, action_name)
+    CUSTOM_CUMULATIVE_REWARD += reward_obj.total
+    CUSTOM_REWARDS.append(reward_obj.total)
+
+    composite = CUSTOM_STATE.composite_score()
+    if CUSTOM_STATE.step_count >= CUSTOM_STATE.max_steps or composite >= 0.90:
+        CUSTOM_STATE.done = True
+
+    summary = _format_custom_summary(CUSTOM_STATE, reward_obj.total, action_name)
+    rationale = ACTION_RATIONALE.get(action_name, "Action applied.")
+    return summary, before, after, _format_diff(before, after), rationale
+
+
+def custom_auto_optimize() -> tuple[str, str, str, str, str]:
+    global CUSTOM_STATE
+    if CUSTOM_STATE is None:
+        err = "ERROR: Initialize custom session first."
+        return err, "", "", "", err
+
+    logs = []
+    while not CUSTOM_STATE.done:
+        action = _suggest_custom_action(CUSTOM_STATE)
+        summary, _, _, _, rationale = custom_step_env(action.value)
+        logs.append(f"step={CUSTOM_STATE.step_count} action={action.value} rationale={rationale}")
+        if CUSTOM_STATE.step_count >= CUSTOM_STATE.max_steps:
+            break
+
+    final_summary = summary if logs else _format_custom_summary(CUSTOM_STATE, 0.0, "no_op")
+    return (
+        final_summary,
+        CUSTOM_INITIAL_DRAFT,
+        CUSTOM_STATE.current_draft,
+        _format_diff(CUSTOM_INITIAL_DRAFT, CUSTOM_STATE.current_draft),
+        "\n".join(logs) if logs else "No optimization steps executed.",
+    )
 
 
 def reset_env(task_id: str) -> str:
@@ -457,6 +645,53 @@ with gr.Blocks(
             auto_btn = gr.Button("Run Full Episode", variant="primary")
         auto_output = gr.Textbox(label="Episode Log", lines=25, max_lines=40)
         auto_btn.click(fn=run_full_episode, inputs=auto_task, outputs=auto_output)
+
+    with gr.Tab("Custom Input"):
+        gr.Markdown("Paste your own content, set goals, and optimize step-by-step.")
+        custom_text = gr.Textbox(
+            label="Input Content",
+            lines=10,
+            value="Announcing our new platform update. It has many features and should help teams work better.",
+        )
+        with gr.Row():
+            custom_keywords = gr.Textbox(
+                label="Target Keywords (comma separated)",
+                value="productivity,workflow,automation,team collaboration",
+            )
+            custom_tone = gr.Dropdown(
+                choices=["professional", "informative", "empathetic"],
+                value="professional",
+                label="Target Tone",
+            )
+            custom_max_steps = gr.Slider(minimum=1, maximum=15, value=10, step=1, label="Max Steps")
+        with gr.Row():
+            custom_reset_btn = gr.Button("Initialize Custom Session", variant="primary")
+            custom_action = gr.Dropdown(choices=ACTIONS, value="rewrite_headline", label="Manual Action")
+            custom_step_btn = gr.Button("Apply Action", variant="secondary")
+            custom_auto_btn = gr.Button("Auto Optimize", variant="secondary")
+
+        custom_summary = gr.Textbox(label="Session Summary", lines=8)
+        custom_rationale = gr.Textbox(label="Reasoning / Action Log", lines=6)
+        with gr.Row():
+            custom_before = gr.Textbox(label="Before", lines=12)
+            custom_after = gr.Textbox(label="After", lines=12)
+        custom_diff = gr.Textbox(label="Unified Diff", lines=14)
+
+        custom_reset_btn.click(
+            fn=custom_reset_env,
+            inputs=[custom_text, custom_keywords, custom_tone, custom_max_steps],
+            outputs=[custom_summary, custom_before, custom_after, custom_diff, custom_rationale],
+        )
+        custom_step_btn.click(
+            fn=custom_step_env,
+            inputs=custom_action,
+            outputs=[custom_summary, custom_before, custom_after, custom_diff, custom_rationale],
+        )
+        custom_auto_btn.click(
+            fn=custom_auto_optimize,
+            inputs=[],
+            outputs=[custom_summary, custom_before, custom_after, custom_diff, custom_rationale],
+        )
 
     with gr.Tab("About"):
         gr.Markdown(
